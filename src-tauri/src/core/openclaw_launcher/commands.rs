@@ -26,15 +26,13 @@ async fn is_port_open(host: &str, port: u16) -> bool {
     }
 }
 
-fn is_process_alive(pid: u32) -> bool {
+async fn is_process_alive(pid: u32) -> bool {
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        match std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {}", pid), "/NH"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-        {
+        let mut command = Command::new("tasklist");
+        command.args(["/FI", &format!("PID eq {}", pid), "/NH"]);
+        apply_no_window(&mut command);
+        match command.output().await {
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 stdout.contains(&pid.to_string())
@@ -80,28 +78,40 @@ async fn find_pid_by_port(port: u16) -> Option<u32> {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let output = Command::new("lsof")
-            .args(["-i", &format!("tcp:{}", port), "-t"])
-            .output()
-            .await
-            .ok()?;
+        let mut command = Command::new("lsof");
+        command.args(["-i", &format!("tcp:{}", port), "-t"]);
+        let output = command.output().await.ok()?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         stdout.lines().next()?.trim().parse().ok()
     }
 }
 
-async fn resolve_gateway_pid_after_spawn() {
+async fn resolve_gateway_pid_after_spawn(expected_spawn_pid: u32) {
     for _ in 0..30 {
         tokio::time::sleep(Duration::from_millis(500)).await;
+        // Only update if the saved PID still matches the expected spawn PID.
+        // This prevents a stale resolve task from overwriting a newer launch.
+        if current_gateway_pid() != Some(expected_spawn_pid) {
+            log::info!("Aborting PID resolve: spawn PID {} no longer current", expected_spawn_pid);
+            return;
+        }
         if let Some(pid) = find_pid_by_port(OPENCLAW_GATEWAY_PORT).await {
-            log::info!("Resolved gateway listener PID {} on port {}", pid, OPENCLAW_GATEWAY_PORT);
-            set_gateway_pid(pid);
+            if pid != expected_spawn_pid {
+                log::info!(
+                    "Resolved gateway listener PID {} (replacing spawn PID {}) on port {}",
+                    pid,
+                    expected_spawn_pid,
+                    OPENCLAW_GATEWAY_PORT
+                );
+                set_gateway_pid(pid);
+            }
             return;
         }
     }
     log::warn!(
-        "Could not resolve gateway listener PID on port {} after 15s; using spawn PID",
-        OPENCLAW_GATEWAY_PORT
+        "Could not resolve gateway listener PID on port {} after 15s; using spawn PID {}",
+        OPENCLAW_GATEWAY_PORT,
+        expected_spawn_pid
     );
 }
 
@@ -265,7 +275,10 @@ async fn get_openclaw_status_inner() -> Result<OpenClawStatus, String> {
         .unwrap_or(None);
 
     let pid = current_gateway_pid();
-    let process_running = pid.map(is_process_alive).unwrap_or(false);
+    let process_running = match pid {
+        Some(p) => is_process_alive(p).await,
+        None => false,
+    };
     let port_open = is_port_open("127.0.0.1", OPENCLAW_GATEWAY_PORT).await;
 
     let health = if process_running && port_open {
@@ -582,7 +595,7 @@ async fn spawn_gateway_foreground(bin: &str, inject_local_model: bool) -> Result
     // On Windows the .cmd wrapper spawns cmd.exe which then spawns node.exe;
     // the spawn PID points to cmd.exe, not the real gateway process.
     tokio::spawn(async move {
-        resolve_gateway_pid_after_spawn().await;
+        resolve_gateway_pid_after_spawn(spawn_pid).await;
     });
 
     if let Some(stdout) = child.stdout.take() {
@@ -695,10 +708,10 @@ async fn kill_gateway_port_listener() {
 async fn kill_gateway_by_pid(pid: u32) {
     #[cfg(target_os = "windows")]
     {
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/F"])
-            .output()
-            .await;
+        let mut command = Command::new("taskkill");
+        command.args(["/PID", &pid.to_string(), "/F"]);
+        apply_no_window(&mut command);
+        let _ = command.output().await;
     }
     #[cfg(not(target_os = "windows"))]
     {
