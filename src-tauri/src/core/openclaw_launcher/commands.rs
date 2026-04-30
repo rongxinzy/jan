@@ -62,6 +62,49 @@ fn current_gateway_pid() -> Option<u32> {
     GATEWAY_PID.lock().ok().and_then(|guard| *guard)
 }
 
+async fn find_pid_by_port(port: u16) -> Option<u32> {
+    #[cfg(target_os = "windows")]
+    {
+        let mut command = Command::new("cmd");
+        command.args([
+            "/C",
+            &format!(
+                "for /f \"tokens=5\" %a in ('netstat -ano ^| findstr :{} ^| findstr LISTENING') do @echo %a",
+                port
+            ),
+        ]);
+        apply_no_window(&mut command);
+        let output = command.output().await.ok()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        stdout.lines().next()?.trim().parse().ok()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let output = Command::new("lsof")
+            .args(["-i", &format!("tcp:{}", port), "-t"])
+            .output()
+            .await
+            .ok()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        stdout.lines().next()?.trim().parse().ok()
+    }
+}
+
+async fn resolve_gateway_pid_after_spawn() {
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if let Some(pid) = find_pid_by_port(OPENCLAW_GATEWAY_PORT).await {
+            log::info!("Resolved gateway listener PID {} on port {}", pid, OPENCLAW_GATEWAY_PORT);
+            set_gateway_pid(pid);
+            return;
+        }
+    }
+    log::warn!(
+        "Could not resolve gateway listener PID on port {} after 15s; using spawn PID",
+        OPENCLAW_GATEWAY_PORT
+    );
+}
+
 fn err_to_string<E: std::fmt::Display>(e: E) -> String {
     format!("Error: {e}")
 }
@@ -532,8 +575,15 @@ async fn spawn_gateway_foreground(bin: &str, inject_local_model: bool) -> Result
         .spawn()
         .map_err(|e| format!("Failed to start OpenClaw gateway: {e}"))?;
 
-    let pid = child.id().ok_or("Failed to get child PID")?;
-    set_gateway_pid(pid);
+    let spawn_pid = child.id().ok_or("Failed to get child PID")?;
+    set_gateway_pid(spawn_pid);
+
+    // Spawn a background task to resolve the actual listener PID via port scan.
+    // On Windows the .cmd wrapper spawns cmd.exe which then spawns node.exe;
+    // the spawn PID points to cmd.exe, not the real gateway process.
+    tokio::spawn(async move {
+        resolve_gateway_pid_after_spawn().await;
+    });
 
     if let Some(stdout) = child.stdout.take() {
         tokio::spawn(async move {
@@ -555,7 +605,7 @@ async fn spawn_gateway_foreground(bin: &str, inject_local_model: bool) -> Result
         });
     }
 
-    Ok(pid)
+    Ok(spawn_pid)
 }
 
 #[tauri::command]
@@ -622,16 +672,15 @@ pub struct OpenClawLaunchResult {
 async fn kill_gateway_port_listener() {
     #[cfg(target_os = "windows")]
     {
-        let mut command = Command::new("cmd");
-        command.args([
-            "/C",
-            &format!(
-                "for /f \"tokens=5\" %a in ('netstat -ano ^| findstr :{}') do taskkill /PID %a /F",
-                OPENCLAW_GATEWAY_PORT
-            ),
-        ]);
-        apply_no_window(&mut command);
-        let _ = command.output().await;
+        // Use PowerShell for reliable port-to-PID resolution and kill.
+        let ps_script = format!(
+            "$conn = netstat -ano | Select-String ':{port}'; foreach ($line in $conn) {{ $parts = $line -split '\\s+' | Where-Object {{ $_ -ne '' }}; if ($parts[-2] -eq 'LISTENING') {{ $procId = $parts[-1]; Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue }} }}",
+            port = OPENCLAW_GATEWAY_PORT
+        );
+        let _ = Command::new("powershell")
+            .args(["-Command", &ps_script])
+            .output()
+            .await;
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -754,5 +803,53 @@ mod tests {
         let decision = resolve_openclaw_install_registry(None);
 
         assert_eq!(decision.as_deref(), Some(TEMPORARY_CHINA_NPM_REGISTRY));
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires OpenClaw to be installed; run manually with: cargo test -- --ignored openclaw_lifecycle"]
+    async fn openclaw_lifecycle_launch_probe_stop() {
+        use super::*;
+
+        // 1. Ensure OpenClaw is installed.
+        let bin = find_openclaw_binary().expect("OpenClaw must be installed for this test");
+
+        // 2. Clean up any existing gateway.
+        stop_openclaw_gateway().await.ok();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let status = get_openclaw_status_inner().await.unwrap();
+        assert!(
+            !status.process_running && !status.port_open,
+            "Gateway should be stopped before test: {:?}",
+            status
+        );
+
+        // 3. Launch gateway.
+        let spawn_pid = spawn_gateway_foreground(&bin, false)
+            .await
+            .expect("Failed to spawn gateway");
+        assert!(spawn_pid > 0);
+
+        // 4. Wait for the gateway to become ready.
+        let running_status = wait_for_openclaw_status(60, |s| {
+            s.process_running && s.port_open
+        })
+        .await
+        .expect("Gateway did not become ready");
+        assert_eq!(running_status.health, "running");
+        assert!(running_status.pid.is_some());
+        assert!(running_status.gateway_url.is_some());
+
+        // 5. Stop the gateway.
+        stop_openclaw_gateway()
+            .await
+            .expect("Failed to stop gateway");
+
+        // 6. Wait for the gateway to fully stop.
+        let stopped_status = wait_for_openclaw_status(40, |s| {
+            !s.process_running && !s.port_open
+        })
+        .await
+        .expect("Gateway did not stop");
+        assert_eq!(stopped_status.health, "stopped");
     }
 }
