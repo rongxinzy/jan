@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
-use serde_json::Value;
 use tauri::{Emitter, Runtime};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -15,6 +15,52 @@ const TEMPORARY_CHINA_NPM_REGISTRY: &str = "https://registry.npmmirror.com";
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+static GATEWAY_PID: StdMutex<Option<u32>> = StdMutex::new(None);
+
+async fn is_port_open(host: &str, port: u16) -> bool {
+    match tokio::time::timeout(Duration::from_secs(2), tokio::net::TcpStream::connect((host, port))).await
+    {
+        Ok(Ok(_)) => true,
+        _ => false,
+    }
+}
+
+fn is_process_alive(pid: u32) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        match std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {}", pid), "/NH"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+        {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                stdout.contains(&pid.to_string())
+            }
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+}
+
+fn set_gateway_pid(pid: u32) {
+    if let Ok(mut guard) = GATEWAY_PID.lock() {
+        *guard = Some(pid);
+    }
+}
+
+fn take_gateway_pid() -> Option<u32> {
+    GATEWAY_PID.lock().ok().and_then(|mut guard| guard.take())
+}
+
+fn current_gateway_pid() -> Option<u32> {
+    GATEWAY_PID.lock().ok().and_then(|guard| *guard)
+}
 
 fn err_to_string<E: std::fmt::Display>(e: E) -> String {
     format!("Error: {e}")
@@ -112,106 +158,12 @@ fn apply_no_window(command: &mut Command) {
 #[cfg(not(target_os = "windows"))]
 fn apply_no_window(_command: &mut Command) {}
 
-fn json_at_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
-    let mut current = value;
-    for key in path {
-        current = current.get(*key)?;
-    }
-    Some(current)
-}
-
-fn json_bool(value: &Value, path: &[&str]) -> Option<bool> {
-    json_at_path(value, path)?.as_bool()
-}
-
-fn json_string(value: &Value, path: &[&str]) -> Option<String> {
-    json_at_path(value, path)?.as_str().map(ToOwned::to_owned)
-}
-
-fn json_u16(value: &Value, path: &[&str]) -> Option<u16> {
-    json_at_path(value, path)?
-        .as_u64()
-        .and_then(|port| u16::try_from(port).ok())
-}
-
-fn is_runtime_running(status: Option<&str>) -> bool {
-    matches!(
-        status,
-        Some("running" | "starting" | "restarting" | "active")
-    )
-}
-
-fn is_runtime_error(status: Option<&str>) -> bool {
-    status.is_some_and(|value| {
-        let normalized = value.to_ascii_lowercase();
-        normalized.contains("error") || normalized.contains("fail")
-    })
-}
-
-fn is_port_busy(port_status: Option<&str>) -> bool {
-    !matches!(port_status, None | Some("free"))
-}
-
 fn gateway_url(bind_host: &str, port: u16) -> String {
     let host = match bind_host {
         "0.0.0.0" | "::" => "127.0.0.1",
         other => other,
     };
     format!("http://{host}:{port}/")
-}
-
-fn compute_health(rpc_ok: bool, runtime_status: Option<&str>, port_status: Option<&str>) -> String {
-    if rpc_ok {
-        "running".to_string()
-    } else if is_runtime_error(runtime_status) {
-        "error".to_string()
-    } else if is_runtime_running(runtime_status) || is_port_busy(port_status) {
-        "degraded".to_string()
-    } else {
-        "stopped".to_string()
-    }
-}
-
-fn build_status_message(
-    service_loaded: bool,
-    health: &str,
-    runtime_detail: Option<&str>,
-    rpc_error: Option<&str>,
-    config_valid: bool,
-) -> Option<String> {
-    if health == "running" {
-        return None;
-    }
-
-    if !service_loaded {
-        return Some("Gateway service missing.".to_string());
-    }
-
-    if !config_valid {
-        return Some("OpenClaw configuration is invalid.".to_string());
-    }
-
-    if health == "degraded" {
-        if let Some(error) = rpc_error {
-            return Some(format!(
-                "Gateway listener is up, but rpc is not ready yet: {error}"
-            ));
-        }
-        if let Some(detail) = runtime_detail {
-            return Some(detail.to_string());
-        }
-    }
-
-    if health == "error" {
-        if let Some(detail) = runtime_detail {
-            return Some(detail.to_string());
-        }
-        if let Some(error) = rpc_error {
-            return Some(error.to_string());
-        }
-    }
-
-    runtime_detail.map(ToOwned::to_owned)
 }
 
 #[tauri::command]
@@ -226,16 +178,9 @@ pub struct OpenClawStatus {
     pub version: Option<String>,
     pub gateway_url: Option<String>,
     pub gateway_port: u16,
-    pub service_loaded: bool,
-    pub service_label: Option<String>,
-    pub service_runtime_status: Option<String>,
-    pub service_runtime_detail: Option<String>,
-    pub rpc_ok: bool,
-    pub rpc_error: Option<String>,
-    pub port_status: Option<String>,
-    pub cli_config_exists: bool,
-    pub daemon_config_exists: bool,
-    pub config_valid: bool,
+    pub process_running: bool,
+    pub pid: Option<u32>,
+    pub port_open: bool,
     pub health: String,
     pub message: Option<String>,
 }
@@ -247,79 +192,11 @@ fn openclaw_not_installed_status() -> OpenClawStatus {
         version: None,
         gateway_url: None,
         gateway_port: OPENCLAW_GATEWAY_PORT,
-        service_loaded: false,
-        service_label: None,
-        service_runtime_status: None,
-        service_runtime_detail: None,
-        rpc_ok: false,
-        rpc_error: None,
-        port_status: None,
-        cli_config_exists: false,
-        daemon_config_exists: false,
-        config_valid: true,
+        process_running: false,
+        pid: None,
+        port_open: false,
         health: "not-installed".to_string(),
         message: None,
-    }
-}
-
-fn parse_gateway_status(
-    json: &Value,
-    binary_path: String,
-    version: Option<String>,
-) -> OpenClawStatus {
-    let bind_host =
-        json_string(json, &["gateway", "bindHost"]).unwrap_or_else(|| "127.0.0.1".to_string());
-    let gateway_port = json_u16(json, &["gateway", "port"]).unwrap_or(OPENCLAW_GATEWAY_PORT);
-    let service_loaded = json_bool(json, &["service", "loaded"]).unwrap_or(false);
-    let service_runtime_status = json_string(json, &["service", "runtime", "status"]);
-    let service_runtime_detail = json_string(json, &["service", "runtime", "detail"]);
-    let rpc_ok = json_bool(json, &["rpc", "ok"]).unwrap_or(false);
-    let rpc_error = json_string(json, &["rpc", "error"]);
-    let port_status = json_string(json, &["port", "status"]);
-    let cli_config_exists = json_bool(json, &["config", "cli", "exists"]).unwrap_or(false);
-    let daemon_config_exists = json_bool(json, &["config", "daemon", "exists"]).unwrap_or(false);
-    let cli_config_valid = json_bool(json, &["config", "cli", "valid"]).unwrap_or(true);
-    let daemon_config_valid = json_bool(json, &["config", "daemon", "valid"]).unwrap_or(true);
-    let config_valid = cli_config_valid && daemon_config_valid;
-    let health = compute_health(
-        rpc_ok,
-        service_runtime_status.as_deref(),
-        port_status.as_deref(),
-    );
-    let gateway_url = if rpc_ok
-        || is_runtime_running(service_runtime_status.as_deref())
-        || is_port_busy(port_status.as_deref())
-    {
-        Some(gateway_url(&bind_host, gateway_port))
-    } else {
-        None
-    };
-    let message = build_status_message(
-        service_loaded,
-        &health,
-        service_runtime_detail.as_deref(),
-        rpc_error.as_deref(),
-        config_valid,
-    );
-
-    OpenClawStatus {
-        installed: true,
-        binary_path: Some(binary_path),
-        version,
-        gateway_url,
-        gateway_port,
-        service_loaded,
-        service_label: json_string(json, &["service", "label"]),
-        service_runtime_status,
-        service_runtime_detail,
-        rpc_ok,
-        rpc_error,
-        port_status,
-        cli_config_exists,
-        daemon_config_exists,
-        config_valid,
-        health,
-        message,
     }
 }
 
@@ -335,55 +212,62 @@ async fn openclaw_version(bin: &str) -> Option<String> {
     stdout.lines().next().map(|line| line.trim().to_string())
 }
 
-async fn run_openclaw_command(
-    bin: &str,
-    args: &[&str],
-    envs: Option<&[(String, String)]>,
-) -> Result<std::process::Output, String> {
-    let mut command = Command::new(bin);
-    command.args(args);
-    if let Some(envs) = envs {
-        command.envs(envs.iter().cloned());
-    }
-    apply_no_window(&mut command);
-    let output = tokio::time::timeout(
-        Duration::from_secs(20),
-        command.output(),
-    )
-    .await
-    .map_err(|_| format!("Timed out after 20s running openclaw {}", args.join(" ")))?
-    .map_err(|e| format!("Failed to run openclaw {}: {e}", args.join(" ")))?;
-    Ok(output)
-}
-
-fn command_error(output: &std::process::Output) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if !stderr.is_empty() {
-        return stderr;
-    }
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
-}
-
 async fn get_openclaw_status_inner() -> Result<OpenClawStatus, String> {
     let Some(bin) = find_openclaw_binary() else {
         return Ok(openclaw_not_installed_status());
     };
 
-    let version = tokio::time::timeout(Duration::from_secs(10), openclaw_version(&bin))
+    let version = tokio::time::timeout(Duration::from_secs(5), openclaw_version(&bin))
         .await
         .unwrap_or(None);
-    let output = run_openclaw_command(&bin, &["gateway", "status", "--json"], None).await?;
-    if !output.status.success() {
-        let detail = command_error(&output);
-        return Err(format!("OpenClaw gateway status failed: {detail}"));
-    }
 
-    let stdout = String::from_utf8(output.stdout)
-        .map_err(|e| format!("OpenClaw gateway status returned invalid UTF-8: {e}"))?;
-    let json: Value = serde_json::from_str(&stdout)
-        .map_err(|e| format!("Failed to parse OpenClaw gateway status JSON: {e}"))?;
+    let pid = current_gateway_pid();
+    let process_running = pid.map(is_process_alive).unwrap_or(false);
+    let port_open = is_port_open("127.0.0.1", OPENCLAW_GATEWAY_PORT).await;
 
-    Ok(parse_gateway_status(&json, bin, version))
+    let health = if process_running && port_open {
+        "running"
+    } else if process_running && !port_open {
+        "degraded"
+    } else if !process_running && port_open {
+        "degraded"
+    } else {
+        "stopped"
+    };
+
+    let gateway_url = if port_open {
+        Some(gateway_url("127.0.0.1", OPENCLAW_GATEWAY_PORT))
+    } else {
+        None
+    };
+
+    let message = if health == "degraded" {
+        if process_running && !port_open {
+            Some("Gateway process is running but port is not responding.".to_string())
+        } else if !process_running && port_open {
+            Some(format!(
+                "Port {} is occupied by another process.",
+                OPENCLAW_GATEWAY_PORT
+            ))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    Ok(OpenClawStatus {
+        installed: true,
+        binary_path: Some(bin),
+        version,
+        gateway_url,
+        gateway_port: OPENCLAW_GATEWAY_PORT,
+        process_running,
+        pid,
+        port_open,
+        health: health.to_string(),
+        message,
+    })
 }
 
 async fn wait_for_openclaw_status<F>(
@@ -405,7 +289,7 @@ where
     }
 
     let detail = last_status
-        .and_then(|status| status.message.or(status.service_runtime_detail))
+        .and_then(|status| status.message)
         .unwrap_or_else(|| {
             "Timed out while waiting for OpenClaw state reconciliation.".to_string()
         });
@@ -635,9 +519,9 @@ fn openclaw_env(inject_local_model: bool) -> Vec<(String, String)> {
     filtered_openclaw_env(std::env::vars(), inject_local_model)
 }
 
-async fn spawn_gateway_foreground(bin: &str, inject_local_model: bool) -> Result<(), String> {
+async fn spawn_gateway_foreground(bin: &str, inject_local_model: bool) -> Result<u32, String> {
     let mut command = Command::new(bin);
-    command.args(["gateway", "run", "--force"]);
+    command.args(["gateway", "run", "--force", "--allow-unconfigured"]);
     command.envs(openclaw_env(inject_local_model));
     apply_no_window(&mut command);
     command
@@ -647,6 +531,9 @@ async fn spawn_gateway_foreground(bin: &str, inject_local_model: bool) -> Result
     let mut child = command
         .spawn()
         .map_err(|e| format!("Failed to start OpenClaw gateway: {e}"))?;
+
+    let pid = child.id().ok_or("Failed to get child PID")?;
+    set_gateway_pid(pid);
 
     if let Some(stdout) = child.stdout.take() {
         tokio::spawn(async move {
@@ -668,7 +555,7 @@ async fn spawn_gateway_foreground(bin: &str, inject_local_model: bool) -> Result
         });
     }
 
-    Ok(())
+    Ok(pid)
 }
 
 #[tauri::command]
@@ -691,56 +578,23 @@ pub async fn launch_openclaw_gateway<R: Runtime>(
         write_openclaw_config(model)?;
     }
 
-    let current_status = get_openclaw_status_inner().await?;
-    let expected_port = current_status.gateway_port;
-    if current_status.service_loaded {
-        let action = if current_status.rpc_ok
-            || is_runtime_running(current_status.service_runtime_status.as_deref())
-        {
-            "restart"
-        } else {
-            "start"
-        };
+    // Always kill any existing gateway process first to avoid conflicts.
+    stop_openclaw_gateway().await.ok();
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
-        let output = run_openclaw_command(
-            &bin,
-            &["gateway", action, "--json"],
-            Some(&openclaw_env(inject_local_model)),
-        )
-        .await?;
-        log::info!(
-            "OpenClaw gateway {} stdout: {}",
-            action,
-            String::from_utf8_lossy(&output.stdout)
-        );
-        if !output.stderr.is_empty() {
-            log::warn!(
-                "OpenClaw gateway {} stderr: {}",
-                action,
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-    } else {
-        if current_status.rpc_ok
-            || is_runtime_running(current_status.service_runtime_status.as_deref())
-            || is_port_busy(current_status.port_status.as_deref())
-        {
-            stop_openclaw_gateway().await?;
-        }
-        spawn_gateway_foreground(&bin, inject_local_model).await?;
-    }
+    let pid = spawn_gateway_foreground(&bin, inject_local_model).await?;
+    log::info!("OpenClaw gateway spawned with PID {}", pid);
 
-    // Wait for gateway readiness in background — don't block the command.
-    // The frontend observes progress via get_openclaw_status polling and
-    // the openclaw-gateway-ready event.
     let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
-        match wait_for_openclaw_status(60, |status| status.rpc_ok).await {
+        match wait_for_openclaw_status(60, |status| status.process_running && status.port_open)
+            .await
+        {
             Ok(final_status) => {
                 let ready_url = final_status
                     .gateway_url
                     .clone()
-                    .unwrap_or_else(|| gateway_url("127.0.0.1", expected_port));
+                    .unwrap_or_else(|| gateway_url("127.0.0.1", OPENCLAW_GATEWAY_PORT));
                 app_handle
                     .emit(
                         GATEWAY_READY_EVENT,
@@ -755,9 +609,8 @@ pub async fn launch_openclaw_gateway<R: Runtime>(
         }
     });
 
-    // Return immediately with the expected gateway URL.
     Ok(OpenClawLaunchResult {
-        gateway_url: gateway_url("127.0.0.1", expected_port),
+        gateway_url: gateway_url("127.0.0.1", OPENCLAW_GATEWAY_PORT),
     })
 }
 
@@ -790,44 +643,37 @@ async fn kill_gateway_port_listener() {
     }
 }
 
+async fn kill_gateway_by_pid(pid: u32) {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .output()
+            .await;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .output()
+            .await;
+    }
+}
+
 #[tauri::command]
 pub async fn stop_openclaw_gateway() -> Result<(), String> {
     log::info!("Stopping OpenClaw gateway...");
 
-    let current_status = get_openclaw_status_inner().await?;
-    if !current_status.installed {
-        return Ok(());
+    if let Some(pid) = take_gateway_pid() {
+        log::info!("Killing OpenClaw gateway process (PID {})", pid);
+        kill_gateway_by_pid(pid).await;
     }
 
-    if let Some(bin) = current_status.binary_path.as_deref() {
-        if current_status.service_loaded {
-            let output = run_openclaw_command(bin, &["gateway", "stop", "--json"], None).await?;
-            log::info!(
-                "OpenClaw gateway stop stdout: {}",
-                String::from_utf8_lossy(&output.stdout)
-            );
-            if !output.stderr.is_empty() {
-                log::warn!(
-                    "OpenClaw gateway stop stderr: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-        }
-    }
+    kill_gateway_port_listener().await;
 
-    if current_status.rpc_ok
-        || is_runtime_running(current_status.service_runtime_status.as_deref())
-        || is_port_busy(current_status.port_status.as_deref())
-    {
-        kill_gateway_port_listener().await;
-    }
-
-    // Verify stop asynchronously — don't block the command.
     tokio::spawn(async move {
         match wait_for_openclaw_status(40, |status| {
-            !status.rpc_ok
-                && !is_runtime_running(status.service_runtime_status.as_deref())
-                && !is_port_busy(status.port_status.as_deref())
+            !status.process_running && !status.port_open
         })
         .await
         {
@@ -841,11 +687,8 @@ pub async fn stop_openclaw_gateway() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
-
     use super::{
-        filtered_openclaw_env, parse_gateway_status, resolve_openclaw_install_registry,
-        TEMPORARY_CHINA_NPM_REGISTRY,
+        filtered_openclaw_env, resolve_openclaw_install_registry, TEMPORARY_CHINA_NPM_REGISTRY,
     };
 
     #[test]
@@ -871,87 +714,6 @@ mod tests {
         );
 
         assert_eq!(filtered, vec![("PATH".to_string(), "C:\\bin".to_string())]);
-    }
-
-    #[test]
-    fn parse_gateway_status_reports_stopped_when_service_is_missing() {
-        let status = parse_gateway_status(
-            &json!({
-                "service": {
-                    "label": "Scheduled Task",
-                    "loaded": false,
-                    "runtime": {
-                        "status": "stopped",
-                        "detail": "Gateway service missing."
-                    }
-                },
-                "config": {
-                    "cli": { "exists": false, "valid": true },
-                    "daemon": { "exists": false, "valid": true }
-                },
-                "gateway": {
-                    "bindHost": "127.0.0.1",
-                    "port": 18789
-                },
-                "port": {
-                    "status": "free"
-                },
-                "rpc": {
-                    "ok": false,
-                    "error": "connect ECONNREFUSED 127.0.0.1:18789"
-                }
-            }),
-            "openclaw".to_string(),
-            Some("OpenClaw 2026.4.24".to_string()),
-        );
-
-        assert_eq!(status.health, "stopped");
-        assert!(!status.service_loaded);
-        assert_eq!(status.gateway_url, None);
-        assert_eq!(status.version.as_deref(), Some("OpenClaw 2026.4.24"));
-    }
-
-    #[test]
-    fn parse_gateway_status_reports_degraded_when_rpc_is_down_but_listener_exists() {
-        let status = parse_gateway_status(
-            &json!({
-                "service": {
-                    "label": "Scheduled Task",
-                    "loaded": true,
-                    "runtime": {
-                        "status": "running",
-                        "detail": "Task is currently running."
-                    }
-                },
-                "config": {
-                    "cli": { "exists": true, "valid": true },
-                    "daemon": { "exists": true, "valid": true }
-                },
-                "gateway": {
-                    "bindHost": "127.0.0.1",
-                    "port": 18789
-                },
-                "port": {
-                    "status": "in-use"
-                },
-                "rpc": {
-                    "ok": false,
-                    "error": "handshake timeout"
-                }
-            }),
-            "openclaw".to_string(),
-            None,
-        );
-
-        assert_eq!(status.health, "degraded");
-        assert_eq!(
-            status.gateway_url.as_deref(),
-            Some("http://127.0.0.1:18789/")
-        );
-        assert!(status
-            .message
-            .as_deref()
-            .is_some_and(|message| message.contains("rpc")));
     }
 
     #[test]
