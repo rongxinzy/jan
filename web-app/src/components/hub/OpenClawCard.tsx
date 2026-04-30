@@ -74,9 +74,9 @@ export interface OpenClawCardProps {
   gatewayUrl?: string
   installProgress?: number
   installMessage?: string
-  serviceStatus?: string
-  rpcStatus?: string
-  configStatus?: string
+  processRunning?: boolean
+  pid?: number
+  portOpen?: boolean
   onInstall?: () => void
   onStart?: () => void
   onStop?: () => void
@@ -94,9 +94,9 @@ export function OpenClawCard({
   gatewayUrl,
   installProgress = 0,
   installMessage = '',
-  serviceStatus,
-  rpcStatus,
-  configStatus,
+  processRunning,
+  pid,
+  portOpen,
   onInstall,
   onStart,
   onStop,
@@ -123,9 +123,9 @@ export function OpenClawCard({
   const summaryItems = [
     version ? { label: '版本', value: version } : null,
     gatewayUrl ? { label: 'Gateway', value: gatewayUrl, mono: true } : null,
-    serviceStatus ? { label: '服务', value: serviceStatus } : null,
-    rpcStatus ? { label: 'RPC', value: rpcStatus } : null,
-    configStatus ? { label: '配置', value: configStatus } : null,
+    pid ? { label: 'PID', value: String(pid) } : null,
+    processRunning !== undefined ? { label: '进程', value: processRunning ? '运行中' : '未运行' } : null,
+    portOpen !== undefined ? { label: '端口', value: portOpen ? '已监听' : '未监听' } : null,
   ].filter(Boolean) as { label: string; value: string; mono?: boolean }[]
 
   return (

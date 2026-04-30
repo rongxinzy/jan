@@ -44,19 +44,6 @@ function OpenClawContent() {
   const fallbackModel = runtimeSummary.selectedModel ?? ollamaModels[0]?.name
   const injectLocalModel = runtimeSummary.launchMode === 'local-ollama-injected'
   const isTransitioning = openClawStatus === 'starting' || openClawStatus === 'stopping'
-  const serviceStatus = diagnostics.serviceLoaded
-    ? diagnostics.serviceRuntimeStatus || 'unknown'
-    : 'service missing'
-  const rpcStatus = diagnostics.rpcOk
-    ? 'ready'
-    : diagnostics.rpcError
-      ? `down: ${diagnostics.rpcError}`
-      : 'down'
-  const configStatus = diagnostics.configValid
-    ? diagnostics.cliConfigExists || diagnostics.daemonConfigExists
-      ? 'valid'
-      : 'missing'
-    : 'invalid'
 
   const handleStartOpenClaw = useCallback(() => {
     setDialogMode('launch')
@@ -121,9 +108,9 @@ function OpenClawContent() {
               gatewayUrl={openClawGatewayUrl}
               installProgress={openClawInstallProgress}
               installMessage={openClawErrorMessage ?? openClawInstallMessage}
-              serviceStatus={serviceStatus}
-              rpcStatus={rpcStatus}
-              configStatus={configStatus}
+              processRunning={diagnostics.processRunning}
+              pid={diagnostics.pid}
+              portOpen={diagnostics.portOpen}
               onInstall={installOpenClaw}
               onStart={handleStartOpenClaw}
               onStop={handleStopOpenClaw}

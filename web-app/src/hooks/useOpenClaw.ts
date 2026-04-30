@@ -29,16 +29,9 @@ export interface OpenClawRuntimeConfig {
 }
 
 export interface OpenClawDiagnostics {
-  serviceLoaded: boolean
-  serviceLabel?: string
-  serviceRuntimeStatus?: string
-  serviceRuntimeDetail?: string
-  rpcOk: boolean
-  rpcError?: string
-  portStatus?: string
-  cliConfigExists: boolean
-  daemonConfigExists: boolean
-  configValid: boolean
+  processRunning: boolean
+  pid?: number
+  portOpen: boolean
   health: string
 }
 
@@ -58,16 +51,9 @@ interface OpenClawBackendStatus {
   version?: string
   gateway_url?: string
   gateway_port?: number
-  service_loaded: boolean
-  service_label?: string
-  service_runtime_status?: string
-  service_runtime_detail?: string
-  rpc_ok: boolean
-  rpc_error?: string
-  port_status?: string
-  cli_config_exists: boolean
-  daemon_config_exists: boolean
-  config_valid: boolean
+  process_running: boolean
+  pid?: number
+  port_open: boolean
   health: string
   message?: string
 }
@@ -101,16 +87,9 @@ function toUiStatus(status: OpenClawBackendStatus): OpenClawStatus {
 
 function toDiagnostics(status: OpenClawBackendStatus): OpenClawDiagnostics {
   return {
-    serviceLoaded: status.service_loaded,
-    serviceLabel: status.service_label,
-    serviceRuntimeStatus: status.service_runtime_status,
-    serviceRuntimeDetail: status.service_runtime_detail,
-    rpcOk: status.rpc_ok,
-    rpcError: status.rpc_error,
-    portStatus: status.port_status,
-    cliConfigExists: status.cli_config_exists,
-    daemonConfigExists: status.daemon_config_exists,
-    configValid: status.config_valid,
+    processRunning: status.process_running,
+    pid: status.pid,
+    portOpen: status.port_open,
     health: status.health,
   }
 }
@@ -129,16 +108,9 @@ export function useOpenClaw(pollIntervalMs = 5000) {
     selectedModel: undefined,
   })
   const [diagnostics, setDiagnostics] = useState<OpenClawDiagnostics>({
-    serviceLoaded: false,
-    serviceLabel: undefined,
-    serviceRuntimeStatus: undefined,
-    serviceRuntimeDetail: undefined,
-    rpcOk: false,
-    rpcError: undefined,
-    portStatus: undefined,
-    cliConfigExists: false,
-    daemonConfigExists: false,
-    configValid: true,
+    processRunning: false,
+    pid: undefined,
+    portOpen: false,
     health: 'not-installed',
   })
   const unlistenInstallRef = useRef<UnlistenFn | null>(null)
